@@ -5,7 +5,6 @@ See qianyou/2026-05-28-pic-sglang-design.md §5.4.
 from __future__ import annotations
 
 import logging
-import os
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional

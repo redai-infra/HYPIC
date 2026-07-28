@@ -887,11 +887,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
     def mamba_slots_per_new_req(self) -> int:
         """Number of allocator slots consumed when a new request is admitted."""
-        return 1 + (
-            self.mamba_ping_pong_track_buffer_size
-            if self.enable_mamba_extra_buffer
-            else 0
-        )
+        if not self.enable_mamba_extra_buffer:
+            return 1
+        if self.enable_mamba_extra_buffer_lazy:
+            return 2
+        return 1 + self.mamba_ping_pong_track_buffer_size
 
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
         return self.req_index_to_mamba_index_mapping[req_indices]

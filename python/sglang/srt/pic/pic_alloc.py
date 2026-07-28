@@ -6,7 +6,7 @@ writes req_to_token mapping, and tracks inflight accounting.
 from __future__ import annotations
 
 import logging
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 

@@ -11,9 +11,9 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefResult,
     IncLockRefResult,
 )
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.pic.picache import PICache
 from sglang.srt.pic.segmenter import segment_hash
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
@@ -152,9 +152,7 @@ class TestPrefillAdder(CustomTestCase):
         req.retracted_stain = False
         req.last_node = None
         req.needs_host_load_back.return_value = False
-        req.set_extend_input_len = lambda value: setattr(
-            req, "extend_input_len", value
-        )
+        req.set_extend_input_len = lambda value: setattr(req, "extend_input_len", value)
 
         adder = self.create_adder(
             self.create_running_batch(),
@@ -174,23 +172,25 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.rem_input_tokens, 900)
 
     def test_pic_admission_uses_actual_request_buffer_size(self):
-        for extra_enabled, ping_pong_size, pool_size in (
-            (False, 0, 2),
-            (True, 1, 3),
+        for extra_enabled, lazy, ping_pong_size, pool_size in (
+            (False, False, 0, 2),
+            (True, False, 1, 3),
+            (True, True, 2, 2),
         ):
             with self.subTest(
                 extra_enabled=extra_enabled,
+                lazy=lazy,
                 ping_pong_size=ping_pong_size,
             ):
-                mamba_allocator = MambaSlotAllocator(
-                    size=pool_size, device="cpu"
-                )
+                mamba_allocator = MambaSlotAllocator(size=pool_size, device="cpu")
                 req_pool = SimpleNamespace(
                     mamba_allocator=mamba_allocator,
                     enable_mamba_extra_buffer=extra_enabled,
+                    enable_mamba_extra_buffer_lazy=lazy,
                     mamba_ping_pong_track_buffer_size=ping_pong_size,
-                    mamba_slots_per_new_req=lambda size=ping_pong_size,
-                    enabled=extra_enabled: 1 + (size if enabled else 0),
+                    mamba_slots_per_new_req=lambda size=ping_pong_size, enabled=extra_enabled, is_lazy=lazy: (
+                        1 if not enabled else 2 if is_lazy else 1 + size
+                    ),
                 )
                 token_allocator = self.create_token_allocator(
                     full_available_size=4096,
@@ -206,7 +206,7 @@ class TestPrefillAdder(CustomTestCase):
                 )
                 req = MagicMock()
                 req.mamba_pool_idx = None
-                req.pic_full_recompute = False
+                req.pic_full_recompute = lazy
                 req.pic_segments = [(0, 5)]
                 req.pic_miss_segments = [(0, 5)]
                 req.pic_segment_entries = {}
@@ -218,7 +218,7 @@ class TestPrefillAdder(CustomTestCase):
                 )
 
                 self.assertTrue(adder._prepare_pic_addition_admission(req))
-                self.assertFalse(req.pic_full_recompute)
+                self.assertEqual(req.pic_full_recompute, lazy)
 
     def test_pic_full_recompute_retries_after_capacity_returns(self):
         mamba_allocator = MambaSlotAllocator(size=2, device="cpu")
@@ -247,9 +247,7 @@ class TestPrefillAdder(CustomTestCase):
         req.pic_segment_entries = {}
         req.prefix_indices = torch.empty(0, dtype=torch.int64)
         req.full_untruncated_fill_ids = [1] * 5
-        req.set_extend_input_len = lambda value: setattr(
-            req, "extend_input_len", value
-        )
+        req.set_extend_input_len = lambda value: setattr(req, "extend_input_len", value)
         adder = self.create_adder(
             self.create_running_batch(),
             tree_cache=pic,
