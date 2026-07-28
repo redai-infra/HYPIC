@@ -4,6 +4,10 @@ Runs on QS (`/usr/bin/python`); imports scatter_xfer which needs torch.
     /usr/bin/python -m sglang.srt.pic.test_scatter_hitrate
 """
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
 
 class _FakeSched:
     def __init__(self, flags):
@@ -69,7 +73,8 @@ def test_notif_parse_contract():
 
 
 if __name__ == "__main__":
-    test_cached_tokens_counts_only_hits()
-    test_cached_tokens_empty()
-    test_notif_parse_contract()
-    print("ALL PASS")
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

@@ -6,8 +6,10 @@ Run via: bash qianyou/run_pic_smoke.sh
 Currently blocked: T20's linear-attn lapic_addition path raises
 NotImplementedError. See qianyou/2026-05-28-pic-sglang-plan.md task 20.
 """
+
 import os
 import time
+
 import pytest
 import requests
 
@@ -59,7 +61,9 @@ def test_pic_argmax_matches_baseline_and_latency_scales():
     _warmup(PIC_URL)
     baseline_text, baseline_lat, _ = _generate(BASELINE_URL, PROMPT)
     pic_text, pic_lat, _ = _generate(PIC_URL, PROMPT)
-    assert pic_text == baseline_text, f"argmax diverged:\n  baseline={baseline_text!r}\n  pic={pic_text!r}"
-    assert pic_lat < baseline_lat * 0.6, (
-        f"PIC latency not reduced enough: pic={pic_lat:.3f}s baseline={baseline_lat:.3f}s"
-    )
+    assert (
+        pic_text == baseline_text
+    ), f"argmax diverged:\n  baseline={baseline_text!r}\n  pic={pic_text!r}"
+    assert (
+        pic_lat < baseline_lat * 0.6
+    ), f"PIC latency not reduced enough: pic={pic_lat:.3f}s baseline={baseline_lat:.3f}s"

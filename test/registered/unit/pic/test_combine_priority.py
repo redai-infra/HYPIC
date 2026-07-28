@@ -1,4 +1,7 @@
 from sglang.srt.pic.scatter_xfer import partition_combine_first
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _Req:
@@ -49,3 +52,11 @@ def test_missing_attr_treated_as_segment():
     q = [bare, c]
     partition_combine_first(q)
     assert q == [c, bare]
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))
