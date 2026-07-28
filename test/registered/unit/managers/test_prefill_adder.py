@@ -112,6 +112,7 @@ class TestPrefillAdder(CustomTestCase):
             mamba_allocator=mamba_allocator,
             enable_mamba_extra_buffer=True,
             mamba_ping_pong_track_buffer_size=2,
+            mamba_slots_per_new_req=lambda: 3,
         )
         token_allocator = self.create_token_allocator(
             full_available_size=4096,
@@ -188,6 +189,8 @@ class TestPrefillAdder(CustomTestCase):
                     mamba_allocator=mamba_allocator,
                     enable_mamba_extra_buffer=extra_enabled,
                     mamba_ping_pong_track_buffer_size=ping_pong_size,
+                    mamba_slots_per_new_req=lambda size=ping_pong_size,
+                    enabled=extra_enabled: 1 + (size if enabled else 0),
                 )
                 token_allocator = self.create_token_allocator(
                     full_available_size=4096,
@@ -216,6 +219,48 @@ class TestPrefillAdder(CustomTestCase):
 
                 self.assertTrue(adder._prepare_pic_addition_admission(req))
                 self.assertFalse(req.pic_full_recompute)
+
+    def test_pic_full_recompute_retries_after_capacity_returns(self):
+        mamba_allocator = MambaSlotAllocator(size=2, device="cpu")
+        req_pool = SimpleNamespace(
+            mamba_allocator=mamba_allocator,
+            mamba_slots_per_new_req=lambda: 3,
+        )
+        token_allocator = self.create_token_allocator(
+            full_available_size=4096,
+            available_size=4096,
+        )
+        token_allocator.device = "cpu"
+        pic = PICache(
+            req_to_token_pool=req_pool,
+            token_to_kv_pool_allocator=token_allocator,
+            mamba_pool=SimpleNamespace(),
+            page_size=1,
+            disable=False,
+        )
+        req = MagicMock()
+        req.mamba_pool_idx = None
+        req.pic_full_recompute = False
+        req.pic_segments = [(0, 5)]
+        req.pic_miss_segments = [(0, 5)]
+        req.pic_hit_segments = []
+        req.pic_segment_entries = {}
+        req.prefix_indices = torch.empty(0, dtype=torch.int64)
+        req.full_untruncated_fill_ids = [1] * 5
+        req.set_extend_input_len = lambda value: setattr(
+            req, "extend_input_len", value
+        )
+        adder = self.create_adder(
+            self.create_running_batch(),
+            tree_cache=pic,
+            token_to_kv_pool_allocator=token_allocator,
+        )
+
+        self.assertFalse(adder._prepare_pic_addition_admission(req))
+        self.assertTrue(req.pic_full_recompute)
+
+        mamba_allocator.free(torch.tensor([3]))
+        self.assertTrue(adder._prepare_pic_addition_admission(req))
 
     def test_preempt_success_high_priority_values_first(self):
         params = [

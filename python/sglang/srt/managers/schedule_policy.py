@@ -878,11 +878,7 @@ class PrefillAdder:
             return True
 
         pool = self.tree_cache.req_to_token_pool
-        factor = 1 + (
-            pool.mamba_ping_pong_track_buffer_size
-            if pool.enable_mamba_extra_buffer
-            else 0
-        )
+        factor = pool.mamba_slots_per_new_req()
         min_tokens = get_global_server_args().pic_segment_min_tokens
 
         def state_need(candidate: Req) -> int:
