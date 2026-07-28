@@ -930,6 +930,18 @@ class PrefillAdder:
         req.prefix_indices = torch.empty(
             0, dtype=torch.int64, device=req.prefix_indices.device
         )
+        # Prevent the normal admission path below from locking or loading back
+        # any generic prefix-cache match discarded by this fallback.
+        req.last_node = None
+        req.last_host_node = None
+        req.best_match_node = None
+        req.host_hit_length = 0
+        req.swa_host_hit_length = 0
+        req.mamba_host_hit_length = 0
+        req.num_matched_prefix_tokens = 0
+        req.storage_hit_length = 0
+        req.cache_protected_len = 0
+        req.mamba_branching_seqlen = None
         req.set_extend_input_len(fill_len)
 
         needed = sum(state_need(candidate) for candidate in admitted)

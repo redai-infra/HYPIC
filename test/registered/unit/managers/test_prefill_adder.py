@@ -147,11 +147,22 @@ class TestPrefillAdder(CustomTestCase):
         req.extend_input_len = 10
         req.output_ids = []
         req.sampling_params = SimpleNamespace(max_new_tokens=1, ignore_eos=False)
-        req.host_hit_length = 0
-        req.swa_host_hit_length = 0
+        req.last_node = object()
+        req.last_host_node = object()
+        req.best_match_node = object()
+        req.host_hit_length = 8
+        req.swa_host_hit_length = 4
+        req.mamba_host_hit_length = 1
+        req.num_matched_prefix_tokens = 98
+        req.storage_hit_length = 6
+        req.cache_protected_len = 90
+        req.mamba_branching_seqlen = 90
         req.retracted_stain = False
-        req.last_node = None
-        req.needs_host_load_back.return_value = False
+        req.needs_host_load_back = lambda: (
+            req.host_hit_length > 0
+            or req.swa_host_hit_length > 0
+            or req.mamba_host_hit_length > 0
+        )
         req.set_extend_input_len = lambda value: setattr(req, "extend_input_len", value)
 
         adder = self.create_adder(
@@ -167,6 +178,16 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(req.extend_input_len, 100)
         self.assertEqual(req.pic_miss_segments, [(0, 100)])
         self.assertEqual(req.pic_segment_entries, {})
+        self.assertIsNone(req.last_node)
+        self.assertIsNone(req.last_host_node)
+        self.assertIsNone(req.best_match_node)
+        self.assertEqual(req.host_hit_length, 0)
+        self.assertEqual(req.swa_host_hit_length, 0)
+        self.assertEqual(req.mamba_host_hit_length, 0)
+        self.assertEqual(req.num_matched_prefix_tokens, 0)
+        self.assertEqual(req.storage_hit_length, 0)
+        self.assertEqual(req.cache_protected_len, 0)
+        self.assertIsNone(req.mamba_branching_seqlen)
         self.assertEqual(locked.lock_ref, 1)
         self.assertIn(req, adder.can_run_list)
         self.assertEqual(adder.rem_input_tokens, 900)
