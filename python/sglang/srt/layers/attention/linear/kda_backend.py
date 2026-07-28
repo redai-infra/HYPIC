@@ -1,7 +1,6 @@
 from typing import List, Optional, Tuple, Union
 
 import torch
-
 from sglang.srt.layers.attention.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from sglang.srt.layers.attention.fla.chunk_intra import chunk_kda_fwd_intra
 from sglang.srt.layers.attention.fla.cumsum import chunk_local_cumsum
@@ -18,12 +17,14 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.pic.conv_tails import (
     build_prev_tail_slots,
     capture_conv_tails,
     load_conv_history,
 )
-from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+from sglang.srt.pic.policy import PICCompose
+from sglang.srt.pic.state_composition import build_addition_prefix_states
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
 from sglang.srt.utils.common import rank0_log
 
@@ -366,6 +367,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         pic_miss_segments = forward_batch.pic_miss_segments
         batch_size = forward_batch.batch_size
         req_cache_indices = self.forward_metadata.mamba_cache_indices
+        is_addition = forward_batch.pic_policy.compose is PICCompose.ADDITION
 
         seg_lengths: List[int] = []
         seg_req_idx: List[int] = []
@@ -425,6 +427,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
         self._pic_req_last_miss_payload = (
             torch.tensor(seg_offsets[1:], dtype=torch.long, device=device) - 1
         )
+        self._pic_seg_offsets = seg_offsets
+        self._pic_has_multiple_misses = any(
+            end - start > 1
+            for start, end in zip(seg_offsets, seg_offsets[1:])
+        )
         self._pic_req_dst_indices_long = torch.tensor(
             dst_indices_list, dtype=torch.long, device=device,
         )
@@ -471,6 +478,17 @@ class KDAAttnBackend(MambaAttnBackendBase):
         self._pic_temp_states_buf = _alloc(
             getattr(self, "_pic_temp_states_buf", None), state_shape, ssm_dtype,
         )
+        if is_addition and self._pic_has_multiple_misses:
+            self._pic_addition_h0_buf = _alloc(
+                getattr(self, "_pic_addition_h0_buf", None),
+                state_shape,
+                ssm_dtype,
+            )
+            self._pic_addition_suffix_buf = _alloc(
+                getattr(self, "_pic_addition_suffix_buf", None),
+                (batch_size, H, D_k, D_v),
+                ssm_dtype,
+            )
 
     def forward_extend_pic_addition(
         self,
@@ -494,18 +512,27 @@ class KDAAttnBackend(MambaAttnBackendBase):
         pic_miss_segments = forward_batch.pic_miss_segments
         batch_size = forward_batch.batch_size
 
-        # --- Seed h0 of FIRST miss segment per request with Σ S_hit ---
         temp_states = self._pic_temp_states_buf
         temp_states.zero_()
-        seg_cursor_a = 0
-        for req_idx in range(batch_size):
-            hit_slots = pic_hit_mamba_slots[req_idx] if pic_hit_mamba_slots else {}
-            n_miss = len(pic_miss_segments[req_idx])
-            if n_miss > 0 and hit_slots:
-                hit_slot_list = list(hit_slots.values())
-                idx_t = torch.tensor(hit_slot_list, dtype=torch.long, device=device)
-                temp_states[seg_cursor_a] = ssm_states.index_select(0, idx_t).sum(dim=0).to(temp_states.dtype)
-            seg_cursor_a += n_miss
+        # The common single-miss case stays on the original one-pass path.
+        # Multi-miss requests first compute each segment from zero so those
+        # position-independent states can seed the additive prefix pass below.
+        if not self._pic_has_multiple_misses:
+            seg_cursor_a = 0
+            for req_idx in range(batch_size):
+                hit_slots = pic_hit_mamba_slots[req_idx] if pic_hit_mamba_slots else {}
+                n_miss = len(pic_miss_segments[req_idx])
+                if n_miss > 0 and hit_slots:
+                    hit_slot_list = list(hit_slots.values())
+                    idx_t = torch.tensor(
+                        hit_slot_list, dtype=torch.long, device=device
+                    )
+                    temp_states[seg_cursor_a] = (
+                        ssm_states.index_select(0, idx_t)
+                        .sum(dim=0)
+                        .to(temp_states.dtype)
+                    )
+                seg_cursor_a += n_miss
 
         # --- Conv1d (KDA: split q/k/v, 3 separate conv calls) ---
         conv_tails_per_layer = self.req_to_token_pool.mamba2_conv_tails_cache(
@@ -583,19 +610,42 @@ class KDAAttnBackend(MambaAttnBackendBase):
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
 
         # --- KDA kernel (g=a already pre-gated, beta=b already sigmoid'd) ---
-        core_attn_out = chunk_kda(
-            q=q, k=k, v=v,
-            g=a, beta=b,
-            initial_state=temp_states,
-            initial_state_indices=self._pic_seg_indices,
-            use_qk_l2norm_in_kernel=True,
-            cu_seqlens=self._pic_seg_cu_seqlens,
-        )
+        def _run_pic_segments(initial_states):
+            return chunk_kda(
+                q=q, k=k, v=v,
+                g=a, beta=b,
+                initial_state=initial_states,
+                initial_state_indices=self._pic_seg_indices,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=self._pic_seg_cu_seqlens,
+            )
 
-        # --- State persistence ---
+        core_attn_out = _run_pic_segments(temp_states)
+
+        # Persist zero-start miss states before the optional output pass mutates
+        # its independent prefix-state workspace.
         if self._pic_trans_persist_src.numel() > 0:
             ssm_states[self._pic_trans_persist_dst] = temp_states[self._pic_trans_persist_src]
-        ssm_states[self._pic_req_dst_indices_long] = temp_states[self._pic_req_last_miss_payload]
+
+        if self._pic_has_multiple_misses:
+            addition_h0 = build_addition_prefix_states(
+                segment_states=temp_states,
+                state_pool=ssm_states,
+                hit_segments_per_request=forward_batch.pic_hit_segments,
+                hit_slots_per_request=pic_hit_mamba_slots,
+                miss_segments_per_request=pic_miss_segments,
+                segment_offsets=self._pic_seg_offsets,
+                out=self._pic_addition_h0_buf,
+                request_suffix_states=self._pic_addition_suffix_buf,
+            )
+            core_attn_out = _run_pic_segments(addition_h0)
+            final_states = addition_h0
+        else:
+            final_states = temp_states
+        final_states = final_states[self._pic_req_last_miss_payload]
+        if self._pic_has_multiple_misses:
+            final_states = final_states + self._pic_addition_suffix_buf
+        ssm_states[self._pic_req_dst_indices_long] = final_states
 
         return core_attn_out
 

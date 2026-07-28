@@ -2,7 +2,6 @@ import os
 from typing import Optional, Tuple, Union
 
 import torch
-
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
@@ -19,13 +18,14 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.pic import diag_layer_dump as _diag_dump
 from sglang.srt.pic.conv_tails import (
     build_prev_tail_slots,
     capture_conv_tails,
     load_conv_history,
 )
-from sglang.srt.pic import diag_layer_dump as _diag_dump
 from sglang.srt.pic.policy import PICCompose
+from sglang.srt.pic.state_composition import build_addition_prefix_states
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
 from sglang.srt.utils.common import rank0_log
 
@@ -702,6 +702,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
             self._pic_req_last_miss_payload = (
                 torch.tensor(seg_offsets[1:], dtype=torch.long, device=device) - 1
             )
+            self._pic_seg_offsets = seg_offsets
+            self._pic_has_multiple_misses = any(
+                end - start > 1
+                for start, end in zip(seg_offsets, seg_offsets[1:])
+            )
         else:
             self._pic_trans_compose_order = trans_compose_order
 
@@ -746,6 +751,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._pic_temp_states_buf = _alloc(
             getattr(self, "_pic_temp_states_buf", None), state_shape, torch.float32,
         )
+        if is_addition and self._pic_has_multiple_misses:
+            self._pic_addition_h0_buf = _alloc(
+                getattr(self, "_pic_addition_h0_buf", None),
+                state_shape,
+                torch.float32,
+            )
+            self._pic_addition_suffix_buf = _alloc(
+                getattr(self, "_pic_addition_suffix_buf", None),
+                (batch_size, H_v, V, K),
+                torch.float32,
+            )
         # transition-only S/T + seeded-h0 buffers.
         if has_transition:
             # ponytail: fp32 (was qkv_dtype/bf16). T in bf16 → ssm_final ~4e-3.
@@ -1116,31 +1132,30 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ssm_states = mamba_cache_params.temporal
 
         pic_hit_mamba_slots = forward_batch.pic_hit_mamba_slots
-        pic_miss_mamba_slots = forward_batch.pic_miss_mamba_slots
         pic_miss_segments = forward_batch.pic_miss_segments
-        req_cache_indices = self.forward_metadata.mamba_cache_indices
         batch_size = forward_batch.batch_size
 
-
-        # --- Seed h0 of the FIRST miss segment per request with Σ S_hit. ---
-        # The kernel evolves this seed naturally → final state is the proper
-        # splice M·Σ + S_miss|0 (LMCache addition semantics). With seed=0
-        # core_attn_out for the question tokens lacks history → wrong first
-        # token. For requests with multiple miss segments, only the first one
-        # is seeded (subsequent intermediates remain zero; this is the same
-        # weakness the prior implementation had, and is rare in v2.0 traffic).
         temp_states = self._pic_temp_states_buf
         temp_states.zero_()
-        seg_cursor_a = 0
-        for req_idx in range(batch_size):
-            hit_slots = pic_hit_mamba_slots[req_idx] if pic_hit_mamba_slots else {}
-            n_miss = len(pic_miss_segments[req_idx])
-            if n_miss > 0 and hit_slots:
-                # Sum ssm_states across all hit slots of this request.
-                hit_slot_list = list(hit_slots.values())
-                idx_t = torch.tensor(hit_slot_list, dtype=torch.long, device=device)
-                temp_states[seg_cursor_a] = ssm_states.index_select(0, idx_t).sum(dim=0).to(temp_states.dtype)
-            seg_cursor_a += n_miss
+        # The common single-miss case stays on the original one-pass path.
+        # Multi-miss requests first compute each segment from zero so those
+        # position-independent states can seed the additive prefix pass below.
+        if not self._pic_has_multiple_misses:
+            seg_cursor_a = 0
+            for req_idx in range(batch_size):
+                hit_slots = pic_hit_mamba_slots[req_idx] if pic_hit_mamba_slots else {}
+                n_miss = len(pic_miss_segments[req_idx])
+                if n_miss > 0 and hit_slots:
+                    hit_slot_list = list(hit_slots.values())
+                    idx_t = torch.tensor(
+                        hit_slot_list, dtype=torch.long, device=device
+                    )
+                    temp_states[seg_cursor_a] = (
+                        ssm_states.index_select(0, idx_t)
+                        .sum(dim=0)
+                        .to(temp_states.dtype)
+                    )
+                seg_cursor_a += n_miss
 
         # --- Conv1d (uses pre-computed metadata) ---
         conv_tails_per_layer = self.req_to_token_pool.mamba2_conv_tails_cache(
@@ -1191,21 +1206,42 @@ class GDNAttnBackend(MambaAttnBackendBase):
         g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
 
         # --- GDN kernel ---
-        core_attn_out, _last_recurrent_state, _h = self.kernel_dispatcher.extend(
-            q=query, k=key, v=value, g=g, beta=beta,
-            ssm_states=temp_states,
-            cache_indices=self._pic_seg_indices,
-            query_start_loc=self._pic_seg_cu_seqlens,
-        )
+        def _run_pic_segments(initial_states):
+            return self.kernel_dispatcher.extend(
+                q=query, k=key, v=value, g=g, beta=beta,
+                ssm_states=initial_states,
+                cache_indices=self._pic_seg_indices,
+                query_start_loc=self._pic_seg_cu_seqlens,
+            )
 
-        # --- State persistence (same shape as transition path: scatter all
-        # miss segs + per-req dst write). With h0 = Σ S_hit seeded into the
-        # first miss segment, temp_states[last_miss_of_req] already equals
-        # the proper M·Σ + S_miss|0 composition — copy it to req_dst_slot.
-        # All three index tensors are precomputed in init_pic_metadata.
+        core_attn_out, _last_recurrent_state, _h = _run_pic_segments(temp_states)
+
+        # Persist zero-start miss states before the optional output pass mutates
+        # its independent prefix-state workspace.
         if self._pic_trans_persist_src.numel() > 0:
             ssm_states[self._pic_trans_persist_dst] = temp_states[self._pic_trans_persist_src]
-        ssm_states[self._pic_req_dst_indices_long] = temp_states[self._pic_req_last_miss_payload]
+
+        if self._pic_has_multiple_misses:
+            addition_h0 = build_addition_prefix_states(
+                segment_states=temp_states,
+                state_pool=ssm_states,
+                hit_segments_per_request=forward_batch.pic_hit_segments,
+                hit_slots_per_request=pic_hit_mamba_slots,
+                miss_segments_per_request=pic_miss_segments,
+                segment_offsets=self._pic_seg_offsets,
+                out=self._pic_addition_h0_buf,
+                request_suffix_states=self._pic_addition_suffix_buf,
+            )
+            core_attn_out, _last_recurrent_state, _h = _run_pic_segments(
+                addition_h0
+            )
+            final_states = addition_h0
+        else:
+            final_states = temp_states
+        final_states = final_states[self._pic_req_last_miss_payload]
+        if self._pic_has_multiple_misses:
+            final_states = final_states + self._pic_addition_suffix_buf
+        ssm_states[self._pic_req_dst_indices_long] = final_states
 
         return core_attn_out
 
