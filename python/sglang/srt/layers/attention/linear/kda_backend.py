@@ -23,6 +23,7 @@ from sglang.srt.pic.conv_tails import (
     capture_conv_tails,
     load_conv_history,
 )
+from sglang.srt.pic.policy import PICCompose
 from sglang.srt.pic.state_composition import build_addition_prefix_states
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
 from sglang.srt.utils.common import rank0_log
@@ -366,6 +367,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         pic_miss_segments = forward_batch.pic_miss_segments
         batch_size = forward_batch.batch_size
         req_cache_indices = self.forward_metadata.mamba_cache_indices
+        is_addition = forward_batch.pic_policy.compose is PICCompose.ADDITION
 
         seg_lengths: List[int] = []
         seg_req_idx: List[int] = []
@@ -476,7 +478,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         self._pic_temp_states_buf = _alloc(
             getattr(self, "_pic_temp_states_buf", None), state_shape, ssm_dtype,
         )
-        if self._pic_has_multiple_misses:
+        if is_addition and self._pic_has_multiple_misses:
             self._pic_addition_h0_buf = _alloc(
                 getattr(self, "_pic_addition_h0_buf", None),
                 state_shape,

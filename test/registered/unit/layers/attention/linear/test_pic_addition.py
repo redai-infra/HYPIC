@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import torch
 from sglang.srt.layers.attention.linear import gdn_backend, kda_backend
+from sglang.srt.pic.policy import POLICIES
 from sglang.srt.pic.state_composition import build_addition_prefix_states
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -79,6 +80,39 @@ class _FakeReqToTokenPool:
 
 
 class TestPICAddition(CustomTestCase):
+    def test_kda_allocates_prefix_workspace_only_for_addition(self):
+        def make_backend():
+            backend = object.__new__(kda_backend.KDAAttnBackend)
+            backend.req_to_token_pool = _FakeReqToTokenPool()
+            backend.forward_metadata = SimpleNamespace(
+                mamba_cache_indices=torch.tensor([3], dtype=torch.int32)
+            )
+            return backend
+
+        def make_batch(policy):
+            return SimpleNamespace(
+                input_ids=torch.tensor([1, 2]),
+                batch_size=1,
+                pic_policy=policy,
+                pic_hit_segments=[[]],
+                pic_hit_mamba_slots=[{}],
+                pic_miss_segments=[[(0, 1), (1, 2)]],
+                pic_miss_mamba_slots=[{(0, 1): 1, (1, 2): 2}],
+            )
+
+        transition_backend = make_backend()
+        sentinel = torch.empty(1)
+        transition_backend._pic_addition_h0_buf = sentinel
+        transition_backend.init_pic_metadata(make_batch(POLICIES["transition"]))
+        self.assertIs(transition_backend._pic_addition_h0_buf, sentinel)
+
+        addition_backend = make_backend()
+        addition_backend.init_pic_metadata(make_batch(POLICIES["addition"]))
+        self.assertEqual(
+            addition_backend._pic_addition_h0_buf.shape,
+            (2, 1, 1, 1),
+        )
+
     def test_addition_prefix_states_handle_mixed_request_shapes(self):
         out = torch.empty(3, 1, 1, 1)
         build_addition_prefix_states(
