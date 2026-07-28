@@ -2,13 +2,18 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import torch
+
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefResult,
     IncLockRefResult,
 )
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.srt.pic.picache import PICache
+from sglang.srt.pic.segmenter import segment_hash
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
@@ -100,6 +105,117 @@ class TestPrefillAdder(CustomTestCase):
         )
         defaults.update(kwargs)
         return PrefillAdder(**defaults)
+
+    def test_pic_addition_exhaustion_is_budgeted_as_full_prefill(self):
+        mamba_allocator = MambaSlotAllocator(size=3, device="cpu")
+        req_pool = SimpleNamespace(
+            mamba_allocator=mamba_allocator,
+            enable_mamba_extra_buffer=True,
+            mamba_ping_pong_track_buffer_size=2,
+        )
+        token_allocator = self.create_token_allocator(
+            full_available_size=4096,
+            available_size=4096,
+        )
+        token_allocator.device = "cpu"
+        pic = PICache(
+            req_to_token_pool=req_pool,
+            token_to_kv_pool_allocator=token_allocator,
+            mamba_pool=SimpleNamespace(),
+            page_size=1,
+            disable=False,
+        )
+        locked = pic._insert_segment(
+            segment_hash([1]),
+            torch.tensor([1]),
+            torch.tensor([99]),
+            mamba_state_slot=9,
+        )
+        locked.lock_ref = 1
+
+        req = MagicMock()
+        req.mamba_pool_idx = None
+        req.pic_full_recompute = False
+        req.pic_segments = [(0, 90), (90, 100)]
+        req.pic_hit_segments = [(0, 90, b"hit")]
+        req.pic_miss_segments = [(90, 100)]
+        req.pic_segment_entries = {b"hit": locked}
+        req.pic_miss_token_positions = torch.arange(90, 100)
+        req.prefix_indices = torch.arange(90)
+        req.full_untruncated_fill_ids = [1] * 100
+        req.extend_input_len = 10
+        req.output_ids = []
+        req.sampling_params = SimpleNamespace(max_new_tokens=1, ignore_eos=False)
+        req.host_hit_length = 0
+        req.swa_host_hit_length = 0
+        req.retracted_stain = False
+        req.last_node = None
+        req.needs_host_load_back.return_value = False
+        req.set_extend_input_len = lambda value: setattr(
+            req, "extend_input_len", value
+        )
+
+        adder = self.create_adder(
+            self.create_running_batch(),
+            tree_cache=pic,
+            token_to_kv_pool_allocator=token_allocator,
+            rem_input_tokens=1000,
+        )
+        result = adder.add_one_req(req, False, None)
+
+        self.assertNotEqual(result, AddReqResult.NO_TOKEN)
+        self.assertTrue(req.pic_full_recompute)
+        self.assertEqual(req.extend_input_len, 100)
+        self.assertEqual(req.pic_miss_segments, [(0, 100)])
+        self.assertEqual(req.pic_segment_entries, {})
+        self.assertEqual(locked.lock_ref, 1)
+        self.assertIn(req, adder.can_run_list)
+        self.assertEqual(adder.rem_input_tokens, 900)
+
+    def test_pic_admission_uses_actual_request_buffer_size(self):
+        for extra_enabled, ping_pong_size, pool_size in (
+            (False, 0, 2),
+            (True, 1, 3),
+        ):
+            with self.subTest(
+                extra_enabled=extra_enabled,
+                ping_pong_size=ping_pong_size,
+            ):
+                mamba_allocator = MambaSlotAllocator(
+                    size=pool_size, device="cpu"
+                )
+                req_pool = SimpleNamespace(
+                    mamba_allocator=mamba_allocator,
+                    enable_mamba_extra_buffer=extra_enabled,
+                    mamba_ping_pong_track_buffer_size=ping_pong_size,
+                )
+                token_allocator = self.create_token_allocator(
+                    full_available_size=4096,
+                    available_size=4096,
+                )
+                token_allocator.device = "cpu"
+                pic = PICache(
+                    req_to_token_pool=req_pool,
+                    token_to_kv_pool_allocator=token_allocator,
+                    mamba_pool=SimpleNamespace(),
+                    page_size=1,
+                    disable=False,
+                )
+                req = MagicMock()
+                req.mamba_pool_idx = None
+                req.pic_full_recompute = False
+                req.pic_segments = [(0, 5)]
+                req.pic_miss_segments = [(0, 5)]
+                req.pic_segment_entries = {}
+
+                adder = self.create_adder(
+                    self.create_running_batch(),
+                    tree_cache=pic,
+                    token_to_kv_pool_allocator=token_allocator,
+                )
+
+                self.assertTrue(adder._prepare_pic_addition_admission(req))
+                self.assertFalse(req.pic_full_recompute)
 
     def test_preempt_success_high_priority_values_first(self):
         params = [
