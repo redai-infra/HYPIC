@@ -65,9 +65,10 @@ def _fake_chunk_kda(
 
 class _FakeReqToTokenPool:
     def __init__(self):
-        self.ssm_states = torch.zeros(4, 1, 1, 1)
+        self.ssm_states = torch.zeros(5, 1, 1, 1)
         self.ssm_states[0] = 10
-        self.conv_states = torch.zeros(4, 2, 3)
+        self.ssm_states[1] = 20
+        self.conv_states = torch.zeros(5, 2, 3)
 
     def mamba2_layer_cache(self, _layer_id):
         return SimpleNamespace(
@@ -85,7 +86,7 @@ class TestPICAddition(CustomTestCase):
             backend = object.__new__(kda_backend.KDAAttnBackend)
             backend.req_to_token_pool = _FakeReqToTokenPool()
             backend.forward_metadata = SimpleNamespace(
-                mamba_cache_indices=torch.tensor([3], dtype=torch.int32)
+                mamba_cache_indices=torch.tensor([4], dtype=torch.int32)
             )
             return backend
 
@@ -94,17 +95,20 @@ class TestPICAddition(CustomTestCase):
                 input_ids=torch.tensor([1, 2]),
                 batch_size=1,
                 pic_policy=policy,
-                pic_hit_segments=[[]],
-                pic_hit_mamba_slots=[{}],
-                pic_miss_segments=[[(0, 1), (1, 2)]],
-                pic_miss_mamba_slots=[{(0, 1): 1, (1, 2): 2}],
+                pic_hit_segments=[[(0, 1, "hit")]],
+                pic_hit_mamba_slots=[{"hit": 0}],
+                pic_miss_segments=[[(1, 2), (2, 3)]],
+                pic_miss_mamba_slots=[{(1, 2): 2, (2, 3): 3}],
             )
 
         transition_backend = make_backend()
-        sentinel = torch.empty(1)
-        transition_backend._pic_addition_h0_buf = sentinel
+        h0_sentinel = torch.empty(1)
+        suffix_sentinel = torch.empty(1)
+        transition_backend._pic_addition_h0_buf = h0_sentinel
+        transition_backend._pic_addition_suffix_buf = suffix_sentinel
         transition_backend.init_pic_metadata(make_batch(POLICIES["transition"]))
-        self.assertIs(transition_backend._pic_addition_h0_buf, sentinel)
+        self.assertIs(transition_backend._pic_addition_h0_buf, h0_sentinel)
+        self.assertIs(transition_backend._pic_addition_suffix_buf, suffix_sentinel)
 
         addition_backend = make_backend()
         addition_backend.init_pic_metadata(make_batch(POLICIES["addition"]))
@@ -112,18 +116,23 @@ class TestPICAddition(CustomTestCase):
             addition_backend._pic_addition_h0_buf.shape,
             (2, 1, 1, 1),
         )
+        self.assertEqual(
+            addition_backend._pic_addition_suffix_buf.shape,
+            (1, 1, 1, 1),
+        )
 
     def test_addition_prefix_states_handle_mixed_request_shapes(self):
         out = torch.empty(3, 1, 1, 1)
+        suffix = torch.empty(2, 1, 1, 1)
         build_addition_prefix_states(
             segment_states=torch.tensor([1.0, 2.0, 3.0]).view(3, 1, 1, 1),
-            state_pool=torch.tensor([10.0, 20.0]).view(2, 1, 1, 1),
+            state_pool=torch.tensor([10.0, 20.0, 30.0]).view(3, 1, 1, 1),
             hit_segments_per_request=[
-                [(1, 2, "interleaved")],
+                [(1, 2, "interleaved"), (3, 4, "suffix")],
                 [(0, 1, "prefix")],
             ],
             hit_slots_per_request=[
-                {"interleaved": 0},
+                {"interleaved": 0, "suffix": 2},
                 {"prefix": 1},
             ],
             miss_segments_per_request=[
@@ -132,18 +141,23 @@ class TestPICAddition(CustomTestCase):
             ],
             segment_offsets=[0, 2, 3],
             out=out,
+            request_suffix_states=suffix,
         )
 
         torch.testing.assert_close(
             out.flatten(),
             torch.tensor([0.0, 11.0, 20.0]),
         )
+        torch.testing.assert_close(
+            suffix.flatten(),
+            torch.tensor([30.0, 0.0]),
+        )
 
     def _make_backend(self, backend_type):
         backend = object.__new__(backend_type)
         backend.req_to_token_pool = _FakeReqToTokenPool()
         backend.forward_metadata = SimpleNamespace(
-            mamba_cache_indices=torch.tensor([3], dtype=torch.int32)
+            mamba_cache_indices=torch.tensor([4], dtype=torch.int32)
         )
         backend._pic_temp_states_buf = torch.empty(2, 1, 1, 1)
         backend._pic_seg_indices = torch.tensor([0, 1], dtype=torch.int32)
@@ -155,20 +169,21 @@ class TestPICAddition(CustomTestCase):
         backend._pic_fused_persist_src = torch.empty(0, dtype=torch.int32)
         backend._pic_fused_persist_dst = torch.empty(0, dtype=torch.int32)
         backend._pic_trans_persist_src = torch.tensor([0, 1], dtype=torch.long)
-        backend._pic_trans_persist_dst = torch.tensor([1, 2], dtype=torch.long)
-        backend._pic_req_dst_indices_long = torch.tensor([3], dtype=torch.long)
+        backend._pic_trans_persist_dst = torch.tensor([2, 3], dtype=torch.long)
+        backend._pic_req_dst_indices_long = torch.tensor([4], dtype=torch.long)
         backend._pic_req_last_miss_payload = torch.tensor([1], dtype=torch.long)
         backend._pic_seg_offsets = [0, 2]
         backend._pic_has_multiple_misses = True
         backend._pic_addition_h0_buf = torch.empty(2, 1, 1, 1)
+        backend._pic_addition_suffix_buf = torch.empty(1, 1, 1, 1)
         return backend
 
     def _make_forward_batch(self):
         return SimpleNamespace(
             batch_size=1,
-            pic_hit_mamba_slots=[{"hit": 0}],
-            pic_hit_segments=[[(1, 2, "hit")]],
-            pic_miss_mamba_slots=[{(0, 1): 1, (2, 3): 2}],
+            pic_hit_mamba_slots=[{"hit": 0, "suffix": 1}],
+            pic_hit_segments=[[(1, 2, "hit"), (3, 4, "suffix")]],
+            pic_miss_mamba_slots=[{(0, 1): 2, (2, 3): 3}],
             pic_miss_segments=[[(0, 1), (2, 3)]],
         )
 
@@ -179,7 +194,7 @@ class TestPICAddition(CustomTestCase):
         )
         torch.testing.assert_close(
             states.flatten(),
-            torch.tensor([10.0, 1.0, 2.0, 7.5]),
+            torch.tensor([10.0, 20.0, 1.0, 2.0, 27.5]),
         )
 
     def test_gdn_addition_carries_history_across_multiple_misses(self):
@@ -232,7 +247,7 @@ class TestPICAddition(CustomTestCase):
         backend._pic_seg_cu_seqlens = torch.tensor([0, 1], dtype=torch.int32)
         backend._pic_seg_lengths = [1]
         backend._pic_trans_persist_src = torch.tensor([0], dtype=torch.long)
-        backend._pic_trans_persist_dst = torch.tensor([1], dtype=torch.long)
+        backend._pic_trans_persist_dst = torch.tensor([2], dtype=torch.long)
         backend._pic_req_last_miss_payload = torch.tensor([0], dtype=torch.long)
         backend._pic_seg_offsets = [0, 1]
         backend._pic_has_multiple_misses = False
@@ -258,7 +273,7 @@ class TestPICAddition(CustomTestCase):
             batch_size=1,
             pic_hit_mamba_slots=[{"hit": 0}],
             pic_hit_segments=[[(0, 1, "hit")]],
-            pic_miss_mamba_slots=[{(0, 1): 1}],
+            pic_miss_mamba_slots=[{(1, 2): 2}],
             pic_miss_segments=[[(1, 2)]],
         )
 
@@ -280,7 +295,7 @@ class TestPICAddition(CustomTestCase):
 
         torch.testing.assert_close(output.flatten(), torch.tensor([6.0]))
         torch.testing.assert_close(
-            backend.req_to_token_pool.ssm_states[3].flatten(),
+            backend.req_to_token_pool.ssm_states[4].flatten(),
             torch.tensor([6.0]),
         )
         self.assertEqual(backend.kernel_dispatcher.call_count, 1)

@@ -757,6 +757,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 state_shape,
                 torch.float32,
             )
+            self._pic_addition_suffix_buf = _alloc(
+                getattr(self, "_pic_addition_suffix_buf", None),
+                (batch_size, H_v, V, K),
+                torch.float32,
+            )
         # transition-only S/T + seeded-h0 buffers.
         if has_transition:
             # ponytail: fp32 (was qkv_dtype/bf16). T in bf16 → ssm_final ~4e-3.
@@ -1225,6 +1230,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 miss_segments_per_request=pic_miss_segments,
                 segment_offsets=self._pic_seg_offsets,
                 out=self._pic_addition_h0_buf,
+                request_suffix_states=self._pic_addition_suffix_buf,
             )
             core_attn_out, _last_recurrent_state, _h = _run_pic_segments(
                 addition_h0
@@ -1232,9 +1238,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
             final_states = addition_h0
         else:
             final_states = temp_states
-        ssm_states[self._pic_req_dst_indices_long] = final_states[
-            self._pic_req_last_miss_payload
-        ]
+        final_states = final_states[self._pic_req_last_miss_payload]
+        if self._pic_has_multiple_misses:
+            final_states = final_states + self._pic_addition_suffix_buf
+        ssm_states[self._pic_req_dst_indices_long] = final_states
 
         return core_attn_out
 

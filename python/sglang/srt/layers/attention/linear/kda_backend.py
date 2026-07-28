@@ -484,6 +484,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 state_shape,
                 ssm_dtype,
             )
+            self._pic_addition_suffix_buf = _alloc(
+                getattr(self, "_pic_addition_suffix_buf", None),
+                (batch_size, H, D_k, D_v),
+                ssm_dtype,
+            )
 
     def forward_extend_pic_addition(
         self,
@@ -631,14 +636,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 miss_segments_per_request=pic_miss_segments,
                 segment_offsets=self._pic_seg_offsets,
                 out=self._pic_addition_h0_buf,
+                request_suffix_states=self._pic_addition_suffix_buf,
             )
             core_attn_out = _run_pic_segments(addition_h0)
             final_states = addition_h0
         else:
             final_states = temp_states
-        ssm_states[self._pic_req_dst_indices_long] = final_states[
-            self._pic_req_last_miss_payload
-        ]
+        final_states = final_states[self._pic_req_last_miss_payload]
+        if self._pic_has_multiple_misses:
+            final_states = final_states + self._pic_addition_suffix_buf
+        ssm_states[self._pic_req_dst_indices_long] = final_states
 
         return core_attn_out
 
