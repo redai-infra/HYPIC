@@ -1,8 +1,12 @@
 from sglang.srt.pic.segmenter import split_and_tokenize
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class FakeTokenizer:
     """Whitespace tokenizer; each token = one int."""
+
     def encode(self, text, add_special_tokens=False):
         return [abs(hash(t)) % 1000 + 1 for t in text.split()]
 
@@ -23,7 +27,11 @@ def test_sep_splits_and_offsets_are_concat_local():
     b = tk.encode("doc one body")
     c = tk.encode("q stuff")
     assert ids == a + b + c
-    assert offs == [(0, len(a)), (len(a), len(a)+len(b)), (len(a)+len(b), len(a)+len(b)+len(c))]
+    assert offs == [
+        (0, len(a)),
+        (len(a), len(a) + len(b)),
+        (len(a) + len(b), len(a) + len(b) + len(c)),
+    ]
 
 
 def test_sep_string_never_in_ids():
@@ -38,3 +46,11 @@ def test_empty_segments_skipped():
     text = "a <<SEP>>  <<SEP>> b"
     ids, offs = split_and_tokenize(text, tk, separator="<<SEP>>")
     assert all(end > start for start, end in offs)
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

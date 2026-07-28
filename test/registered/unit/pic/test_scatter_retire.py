@@ -1,5 +1,9 @@
 import types
+
 import sglang.srt.pic.scatter_xfer as sx
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _Entry:
@@ -19,7 +23,11 @@ class _Req:
         self.finished_reason = None
         self.mamba_pool_idx = None
         self.origin_input_ids = [1, 2, 3]
-        self.pic_scatter_meta = {"combine_addr": "http://127.0.0.1:1", "scatter_room": 7, "seg_index": 0}
+        self.pic_scatter_meta = {
+            "combine_addr": "http://127.0.0.1:1",
+            "scatter_room": 7,
+            "seg_index": 0,
+        }
 
 
 class _Sched:
@@ -44,15 +52,17 @@ def test_retire_hit_releases_hold_pushes_and_finishes(monkeypatch):
     sched = _Sched(entry, seg_hash)
     req = _Req()
     called = {}
-    monkeypatch.setattr(sx, "maybe_push_after_prefill", lambda r, s: called.setdefault("push", (r, s)))
+    monkeypatch.setattr(
+        sx, "maybe_push_after_prefill", lambda r, s: called.setdefault("push", (r, s))
+    )
 
     sx.pic_scatter_retire(sched, req, seg_hash, recomputed=False)
 
-    assert called["push"] == (req, sched)          # push invoked
-    assert entry.lock_ref == 0                       # +1 released, net 0
-    assert sched.freed_mamba == []                   # hit path frees no mamba
-    assert req.finished_reason is not None           # finished
-    assert sched.streamed == [req]                   # client notified
+    assert called["push"] == (req, sched)  # push invoked
+    assert entry.lock_ref == 0  # +1 released, net 0
+    assert sched.freed_mamba == []  # hit path frees no mamba
+    assert req.finished_reason is not None  # finished
+    assert sched.streamed == [req]  # client notified
 
 
 def test_retire_recomputed_frees_mamba(monkeypatch):
@@ -65,6 +75,14 @@ def test_retire_recomputed_frees_mamba(monkeypatch):
 
     sx.pic_scatter_retire(sched, req, seg_hash, recomputed=True)
 
-    assert entry.lock_ref == 0                        # +1 released
-    assert sched.freed_mamba == [req]                 # miss path frees mamba
+    assert entry.lock_ref == 0  # +1 released
+    assert sched.freed_mamba == [req]  # miss path frees mamba
     assert req.finished_reason is not None
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

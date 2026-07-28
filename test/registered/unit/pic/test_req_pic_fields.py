@@ -4,8 +4,12 @@ Test is intentionally minimal: we construct Req via the canonical minimal
 signature and just check field defaults. Behavior is covered in PICache
 tests (T10-T13) and integration (T23).
 """
+
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def test_req_has_pic_fields():
@@ -23,5 +27,8 @@ def test_req_has_pic_fields():
 
 
 if __name__ == "__main__":
-    test_req_has_pic_fields()
-    print("ok")
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

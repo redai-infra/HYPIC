@@ -1,14 +1,18 @@
 """Tests for sglang.srt.pic.pic_alloc.pic_alloc_for_extend."""
+
 from __future__ import annotations
 
 from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.pic.segmenter import segment_hash
 import sglang.srt.pic.pic_alloc as pic_alloc
 from sglang.srt.pic.pic_alloc import pic_alloc_for_extend
-from sglang.srt.pic.picache import PICache, SegmentEntry
+from sglang.srt.pic.picache import PICache
+from sglang.srt.pic.segmenter import segment_hash
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _Args:
@@ -62,6 +66,7 @@ class _FakeReqToTokenPool:
         self.req_to_token = torch.zeros((size, max_context_len), dtype=torch.int64)
         self.free_slots = list(range(size))
         self.mamba_pool = mamba_pool
+        self.mamba_allocator = mamba_pool
 
     def available_size(self):
         return len(self.free_slots)
@@ -95,14 +100,16 @@ def _make_req(req_pool_idx_initial=None):
     )
 
 
-def _make_picache():
+def _make_picache(pic_mode="addition"):
     pic_alloc.get_global_server_args = lambda: _Args()
+    mamba_allocator = _FakeMambaPool()
     return PICache(
-        req_to_token_pool=SimpleNamespace(),
+        req_to_token_pool=SimpleNamespace(mamba_allocator=mamba_allocator),
         token_to_kv_pool_allocator=_FakeAllocator(),
-        mamba_pool=_FakeMambaPool(),
+        mamba_pool=mamba_allocator,
         page_size=1,
         disable=False,
+        pic_mode=pic_mode,
     )
 
 
@@ -141,7 +148,7 @@ def test_pic_alloc_for_extend_hit_miss_last_segment():
 
     # Total miss tokens = 3 + 3 = 6.
     assert out_cache_loc.shape == (6,), out_cache_loc.shape
-    assert rpi == [0]
+    assert rpi.tolist() == [0]
     assert rpi_device.tolist() == [0]
     assert req.req_pool_idx == 0
 
@@ -185,8 +192,7 @@ def test_pic_alloc_for_extend_all_miss_no_hits():
 
 
 def test_pic_alloc_transition_rope_single_segment_has_public_slots():
-    pic = _make_picache()
-    pic.pic_mode = "transition_rope"
+    pic = _make_picache(pic_mode="transition_rope")
     req = _make_req()
     req.pic_segments = [(0, 5)]
     req.pic_miss_segments = [(0, 5)]
@@ -206,3 +212,11 @@ def test_pic_alloc_transition_rope_single_segment_has_public_slots():
     assert public is not None
     assert public.numel() == 5
     assert mamba is not None
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

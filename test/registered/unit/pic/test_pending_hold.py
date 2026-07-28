@@ -6,6 +6,9 @@ segment stays 0: +1 at register, -1 at fire or timeout-drop."""
 import types
 
 import sglang.srt.pic.scatter_xfer as sx
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _Entry:
@@ -60,7 +63,8 @@ def test_fire_releases_pending_hold(monkeypatch):
 
     fired = {"n": 0}
     monkeypatch.setattr(
-        sx, "_start_write",
+        sx,
+        "_start_write",
         lambda s, h, e, room, seg, sh: fired.__setitem__("n", fired["n"] + 1),
     )
     sched._pic_scatter_handles = {(42, 0): object()}
@@ -111,3 +115,11 @@ def test_timeout_drop_releases_pending_hold(monkeypatch):
 
     assert entry.lock_ref == 0, "pending-hold not released on timeout-drop (net != 0)"
     assert sched._pic_push_pending == []
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))
