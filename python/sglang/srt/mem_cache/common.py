@@ -415,11 +415,7 @@ def alloc_req_slots(
     if isinstance(req_to_token_pool, HybridReqToTokenPool):
         mamba_available_size = req_to_token_pool.mamba_allocator.available_size()
         if tree_cache.supports_mamba():
-            factor = (
-                MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
-                if req_to_token_pool.enable_mamba_extra_buffer_lazy
-                else MAMBA_STATE_PER_REQ_PREFIX_CACHE
-            )
+            factor = req_to_token_pool.mamba_slots_per_new_req()
         else:
             factor = MAMBA_STATE_PER_REQ_NO_CACHE
         mamba_state_needed = num_reqs * factor
