@@ -2,6 +2,9 @@ import types
 
 import sglang.srt.pic.segmenter as seg
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
