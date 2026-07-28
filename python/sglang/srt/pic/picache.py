@@ -5,7 +5,6 @@ See qianyou/2026-05-28-pic-sglang-design.md §5.4.
 from __future__ import annotations
 
 import logging
-import os
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -335,6 +334,10 @@ class PICache(BasePrefixCache):
         """
         miss_segments: List = getattr(req, "pic_miss_segments", []) or []
         miss_slots: Dict = getattr(req, "pic_miss_segment_slots", {}) or {}
+        if getattr(req, "pic_full_recompute", False):
+            req.pic_cache_owned_miss_segments = set()
+            req.pic_freed_miss_segments = set()
+            return
         is_transition = self.policy.compose is PICCompose.TRANSITION
         is_rope = self.policy.rope
 
@@ -413,8 +416,15 @@ class PICache(BasePrefixCache):
         if miss_slots:
             is_transition = self.policy.compose is PICCompose.TRANSITION
             is_rope = self.policy.rope
+            if getattr(req, "pic_full_recompute", False):
+                assert not is_transition and not is_rope
+                all_kv = torch.cat([slots for slots, _mamba in miss_slots.values()])
+                self.token_to_kv_pool_allocator.free(all_kv)
+                self.remove_inflight(all_kv.numel(), 0)
+                miss_slots = {}
             if is_insert:
-                self.cache_unfinished_req(req)
+                if miss_slots:
+                    self.cache_unfinished_req(req)
             if not is_transition:
                 # addition: free inflight against the single miss kv_slots tuple.
                 if is_rope:
@@ -437,7 +447,7 @@ class PICache(BasePrefixCache):
                 self.remove_inflight(inflight_tokens, inflight_mamba)
             # Free last segment's slots (never cached by design).
             pic_segments = getattr(req, "pic_segments", None)
-            if pic_segments and len(pic_segments) > 1:
+            if miss_slots and pic_segments and len(pic_segments) > 1:
                 last_seg = tuple(pic_segments[-1])
                 if last_seg in miss_slots:
                     if is_rope:
@@ -461,7 +471,7 @@ class PICache(BasePrefixCache):
                             1 if last_mamba is not None else 0,
                         )
 
-            if not is_rope:
+            if miss_slots and not is_rope:
                 min_tokens = getattr(
                     get_global_server_args(), "pic_segment_min_tokens", -1
                 )

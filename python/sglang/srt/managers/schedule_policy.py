@@ -44,12 +44,15 @@ from sglang.srt.mem_cache.allocator.hisparse import (
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    EvictParams,
     InitLoadBackParams,
     InsertParams,
     MatchPrefixParams,
     zero_match_result,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.pic.picache import PICache
+from sglang.srt.pic.policy import PICCompose
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 
 if TYPE_CHECKING:
@@ -865,6 +868,85 @@ class PrefillAdder:
 
         return self.budget_state()
 
+    def _prepare_pic_addition_admission(self, req: Req) -> bool:
+        """Reserve PIC state capacity or convert the candidate to full prefill."""
+        if (
+            not isinstance(self.tree_cache, PICache)
+            or self.tree_cache.policy.compose is not PICCompose.ADDITION
+            or self.tree_cache.policy.rope
+        ):
+            return True
+
+        pool = self.tree_cache.req_to_token_pool
+        factor = pool.mamba_slots_per_new_req()
+        min_tokens = get_global_server_args().pic_segment_min_tokens
+
+        def state_need(candidate: Req) -> int:
+            request_slots = factor if candidate.mamba_pool_idx is None else 0
+            if getattr(candidate, "pic_full_recompute", False):
+                return request_slots
+            last_seg = (
+                tuple(candidate.pic_segments[-1])
+                if candidate.pic_segments
+                else None
+            )
+            segment_slots = sum(
+                (start, end) == last_seg
+                or min_tokens <= 0
+                or end - start >= min_tokens
+                for start, end in candidate.pic_miss_segments
+            )
+            return request_slots + segment_slots
+
+        admitted = [*self.can_run_list, req]
+        needed = sum(state_need(candidate) for candidate in admitted)
+        allocator = pool.mamba_allocator
+        shortage = needed - allocator.available_size()
+        if shortage > 0:
+            candidate_entries = list(
+                {id(entry): entry for entry in req.pic_segment_entries.values()}.values()
+            )
+            for entry in candidate_entries:
+                entry.lock_ref += 1
+            try:
+                self.tree_cache.evict(
+                    EvictParams(num_tokens=0, mamba_num=shortage)
+                )
+            finally:
+                for entry in candidate_entries:
+                    entry.lock_ref -= 1
+        if needed <= allocator.available_size():
+            return True
+
+        # The candidate has not acquired PIC locks yet. Re-admit it below with
+        # its complete prompt cost and without references to discarded hits.
+        fill_len = len(req.full_untruncated_fill_ids)
+        req.pic_full_recompute = True
+        req.pic_segments = [(0, fill_len)]
+        req.pic_hit_segments = []
+        req.pic_miss_segments = [(0, fill_len)]
+        req.pic_segment_entries = {}
+        req.pic_miss_token_positions = torch.arange(fill_len, dtype=torch.int64)
+        req.prefix_indices = torch.empty(
+            0, dtype=torch.int64, device=req.prefix_indices.device
+        )
+        # Prevent the normal admission path below from locking or loading back
+        # any generic prefix-cache match discarded by this fallback.
+        req.last_node = None
+        req.last_host_node = None
+        req.best_match_node = None
+        req.host_hit_length = 0
+        req.swa_host_hit_length = 0
+        req.mamba_host_hit_length = 0
+        req.num_matched_prefix_tokens = 0
+        req.storage_hit_length = 0
+        req.cache_protected_len = 0
+        req.mamba_branching_seqlen = None
+        req.set_extend_input_len(fill_len)
+
+        needed = sum(state_need(candidate) for candidate in admitted)
+        return needed <= allocator.available_size()
+
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
@@ -886,6 +968,9 @@ class PrefillAdder:
 
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
             return AddReqResult.OTHER
+
+        if not self._prepare_pic_addition_admission(req):
+            return AddReqResult.NO_TOKEN
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)

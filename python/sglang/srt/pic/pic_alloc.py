@@ -6,7 +6,7 @@ writes req_to_token mapping, and tracks inflight accounting.
 from __future__ import annotations
 
 import logging
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 
@@ -90,6 +90,7 @@ def _pic_alloc_standard(batch) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
             mamba_slot = (
                 _alloc_one_mamba(mamba_pool, tree_cache)
                 if cacheable_local
+                and not getattr(req, "pic_full_recompute", False)
                 else None
             )
             req.pic_miss_segment_slots[(start, end)] = (slot_chunk, mamba_slot)
