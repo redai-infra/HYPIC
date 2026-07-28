@@ -2,10 +2,10 @@
 
 See qianyou/2026-05-28-pic-sglang-design.md §5.4.
 """
+
 from __future__ import annotations
 
 import logging
-import os
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -38,10 +38,11 @@ class SegmentEntry:
     that the existing `EvictionStrategy` classes (LRUStrategy/FIFOStrategy/...)
     duck-type on us without modification.
     """
+
     seg_hash: bytes
-    full_kv_slots: torch.Tensor          # int64, len == segment length
-    mamba_state_slot: int                # MambaPool slot id
-    token_ids: torch.Tensor              # for hash-collision fallback compare
+    full_kv_slots: torch.Tensor  # int64, len == segment length
+    mamba_state_slot: int  # MambaPool slot id
+    token_ids: torch.Tensor  # for hash-collision fallback compare
     lock_ref: int = 0
     last_access_time: float = 0.0
     creation_time: float = 0.0
@@ -93,6 +94,17 @@ class PICache(BasePrefixCache):
     def supports_mamba(self) -> bool:
         return True
 
+    def _free_mamba_slots(self, slots: List[int]) -> None:
+        if not slots:
+            return
+        self.mamba_allocator.free(
+            torch.tensor(
+                slots,
+                dtype=torch.int64,
+                device=self.mamba_allocator.device,
+            )
+        )
+
     def is_chunk_cache(self) -> bool:
         return False
 
@@ -131,7 +143,10 @@ class PICache(BasePrefixCache):
         return sum(1 for e in self._entries.values() if e.lock_ref == 0)
 
     def mamba_protected_size(self) -> int:
-        return sum(1 for e in self._entries.values() if e.lock_ref > 0) + self._inflight_mamba_slots
+        return (
+            sum(1 for e in self._entries.values() if e.lock_ref > 0)
+            + self._inflight_mamba_slots
+        )
 
     def full_protected_size(self) -> int:
         return self.protected_size() + self._inflight_full_tokens
@@ -142,7 +157,9 @@ class PICache(BasePrefixCache):
 
     def remove_inflight(self, num_tokens: int, num_mamba_slots: int) -> None:
         self._inflight_full_tokens = max(0, self._inflight_full_tokens - num_tokens)
-        self._inflight_mamba_slots = max(0, self._inflight_mamba_slots - num_mamba_slots)
+        self._inflight_mamba_slots = max(
+            0, self._inflight_mamba_slots - num_mamba_slots
+        )
 
     def supports_swa(self) -> bool:
         return False
@@ -190,7 +207,9 @@ class PICache(BasePrefixCache):
             self.protected_size(),
         )
 
-    def _match_segment(self, seg_hash: bytes, token_ids: torch.Tensor) -> Optional[SegmentEntry]:
+    def _match_segment(
+        self, seg_hash: bytes, token_ids: torch.Tensor
+    ) -> Optional[SegmentEntry]:
         entry = self._entries.get(seg_hash)
         if entry is None:
             return None
@@ -234,12 +253,16 @@ class PICache(BasePrefixCache):
         self._entries[seg_hash] = entry
         return entry
 
-    def inject_received_segment(self, seg_hash, token_ids, full_kv_slots, mamba_state_slot):
+    def inject_received_segment(
+        self, seg_hash, token_ids, full_kv_slots, mamba_state_slot
+    ):
         existing = self._entries.get(seg_hash)
         if existing is not None:
             existing.lock_ref += 1
             return existing
-        entry = self._insert_segment(seg_hash, token_ids, full_kv_slots, mamba_state_slot)
+        entry = self._insert_segment(
+            seg_hash, token_ids, full_kv_slots, mamba_state_slot
+        )
         entry.lock_ref += 1
         return entry
 
@@ -248,8 +271,11 @@ class PICache(BasePrefixCache):
         Lock acquired later in schedule_policy._req_inc_lock_ref.
         """
         req = params.req
-        device = (self.token_to_kv_pool_allocator.device
-                  if hasattr(self.token_to_kv_pool_allocator, "device") else "cpu")
+        device = (
+            self.token_to_kv_pool_allocator.device
+            if hasattr(self.token_to_kv_pool_allocator, "device")
+            else "cpu"
+        )
         empty_indices = torch.empty((0,), dtype=torch.int64, device=device)
         empty = MatchResult(
             device_indices=empty_indices,
@@ -258,7 +284,12 @@ class PICache(BasePrefixCache):
             best_match_node=None,
             pic_segment_entries=None,
         )
-        if self.disable or req is None or getattr(req, "pic_segments", None) is None or len(req.pic_segments) == 0:
+        if (
+            self.disable
+            or req is None
+            or getattr(req, "pic_segments", None) is None
+            or len(req.pic_segments) == 0
+        ):
             return empty
 
         segments = req.pic_segments
@@ -268,6 +299,7 @@ class PICache(BasePrefixCache):
         is_recompute = self.policy.recompute
         if is_recompute:
             from sglang.srt.pic import SEAM_SINK_DEFAULT, resolve_seam_sink_tokens
+
             seam_sink = SEAM_SINK_DEFAULT
             req.pic_hit_seam_positions = {}
 
@@ -277,7 +309,9 @@ class PICache(BasePrefixCache):
             min_tokens = getattr(get_global_server_args(), "pic_segment_min_tokens", -1)
             if min_tokens > 0 and end - start < min_tokens:
                 continue
-            seg_token_ids = torch.tensor(req.origin_input_ids[start:end], dtype=torch.int64)
+            seg_token_ids = torch.tensor(
+                req.origin_input_ids[start:end], dtype=torch.int64
+            )
             h_bytes = segment_hash(seg_token_ids)
             entry = self._match_segment(h_bytes, seg_token_ids)
             if entry is not None:
@@ -310,7 +344,11 @@ class PICache(BasePrefixCache):
         hit_tokens = sum(e.full_kv_slots.numel() for e in per_seg if e is not None)
         logger.info(
             "PICache.match_prefix: %d segments, %d hit (%d tokens), %d miss, cache_size=%d entries",
-            len(segments), num_hit, hit_tokens, num_miss, len(self._entries),
+            len(segments),
+            num_hit,
+            hit_tokens,
+            num_miss,
+            len(self._entries),
         )
 
         return MatchResult(
@@ -343,8 +381,9 @@ class PICache(BasePrefixCache):
         inflight_mamba = 0
         req.pic_cache_owned_miss_segments = set()
         req.pic_freed_miss_segments = set()
+        duplicate_mamba_slots = []
         min_tokens = getattr(get_global_server_args(), "pic_segment_min_tokens", -1)
-        for (start, end) in miss_segments:
+        for start, end in miss_segments:
             # ponytail: the last segment (Q) is normally not cached (recomputed by
             # decode). A scatter single-seg sub-request has exactly one segment that
             # IS the "last" one but MUST be cached + pushed to combine — don't skip.
@@ -367,19 +406,19 @@ class PICache(BasePrefixCache):
             slot_tuple = miss_slots[(start, end)]
             if is_rope:
                 _private_slots, public_slots, mamba_slot = slot_tuple
-                assert public_slots is not None, (
-                    "local miss segment must have a public slot in rope PIC modes"
-                )
+                assert (
+                    public_slots is not None
+                ), "local miss segment must have a public slot in rope PIC modes"
                 kv_slots = public_slots
             else:
                 kv_slots, mamba_slot = slot_tuple
-            assert mamba_slot is not None, (
-                "cacheable miss segment must have a mamba slot"
-            )
+            assert (
+                mamba_slot is not None
+            ), "cacheable miss segment must have a mamba slot"
             existing = self._match_segment(seg_hash, seg_ids)
             if existing is not None:
                 self.token_to_kv_pool_allocator.free(kv_slots)
-                self.mamba_allocator.free(torch.tensor([mamba_slot], dtype=torch.int64, device=kv_slots.device))
+                duplicate_mamba_slots.append(mamba_slot)
                 req.pic_segment_entries[seg_hash] = existing
                 req.pic_freed_miss_segments.add((start, end))
             else:
@@ -395,6 +434,8 @@ class PICache(BasePrefixCache):
             inflight_tokens += kv_slots.numel()
             inflight_mamba += 1
 
+        self._free_mamba_slots(duplicate_mamba_slots)
+
         # Transition mode: inflight -> lock_ref handoff (for the slots now owned
         # by entries — i.e. public-slot inflight for rope, kv-slot inflight for
         # plain transition). Private-slot inflight (rope only) is removed by
@@ -405,12 +446,14 @@ class PICache(BasePrefixCache):
         if inserted > 0:
             logger.info(
                 "PICache.cache_unfinished_req: inserted %d new segments, total cache=%d entries",
-                inserted, len(self._entries),
+                inserted,
+                len(self._entries),
             )
 
     def cache_finished_req(self, req, is_insert: bool = True, **kwargs) -> None:
         miss_slots = getattr(req, "pic_miss_segment_slots", None)
         if miss_slots:
+            mamba_slots_to_free = []
             is_transition = self.policy.compose is PICCompose.TRANSITION
             is_rope = self.policy.rope
             if is_insert:
@@ -423,7 +466,8 @@ class PICache(BasePrefixCache):
                         for priv, pub, _mamba in miss_slots.values()
                     )
                     inflight_mamba = sum(
-                        1 for _priv, _pub, mamba in miss_slots.values()
+                        1
+                        for _priv, _pub, mamba in miss_slots.values()
                         if mamba is not None
                     )
                 else:
@@ -431,8 +475,7 @@ class PICache(BasePrefixCache):
                         slots.numel() for slots, _mamba in miss_slots.values()
                     )
                     inflight_mamba = sum(
-                        1 for _slots, mamba in miss_slots.values()
-                        if mamba is not None
+                        1 for _slots, mamba in miss_slots.values() if mamba is not None
                     )
                 self.remove_inflight(inflight_tokens, inflight_mamba)
             # Free last segment's slots (never cached by design).
@@ -445,16 +488,11 @@ class PICache(BasePrefixCache):
                         last_priv, last_pub, last_mamba = miss_slots[last_seg]
                         assert last_pub is None
                         self.token_to_kv_pool_allocator.free(last_priv)
-                        last_dev = last_priv.device
                     else:
                         last_kv, last_mamba = miss_slots[last_seg]
                         self.token_to_kv_pool_allocator.free(last_kv)
-                        last_dev = last_kv.device
                     if last_mamba is not None:
-                        self.mamba_allocator.free(
-                            torch.tensor([last_mamba], dtype=torch.int64,
-                                         device=last_dev)
-                        )
+                        mamba_slots_to_free.append(last_mamba)
                     if is_transition and not is_rope:
                         self.remove_inflight(
                             last_kv.numel(),
@@ -485,18 +523,9 @@ class PICache(BasePrefixCache):
                 if skipped_slots:
                     combined = torch.cat(skipped_slots)
                     self.token_to_kv_pool_allocator.free(combined)
-                    if skipped_mamba_slots:
-                        self.mamba_allocator.free(
-                            torch.tensor(
-                                skipped_mamba_slots,
-                                dtype=torch.int64,
-                                device=combined.device,
-                            )
-                        )
+                    mamba_slots_to_free.extend(skipped_mamba_slots)
                     if is_transition:
-                        self.remove_inflight(
-                            skipped_tokens, len(skipped_mamba_slots)
-                        )
+                        self.remove_inflight(skipped_tokens, len(skipped_mamba_slots))
 
             # transition_rope: free ALL miss private slots (local miss private was
             # never registered to an entry; global private was just freed above).
@@ -522,12 +551,14 @@ class PICache(BasePrefixCache):
                     gp = miss_slots[global_seg][0]
                     self.remove_inflight(gp.numel(), 1)  # +1 for global mamba
 
+            self._free_mamba_slots(mamba_slots_to_free)
+
         # transition_rope[_recompute]: free private hit slots (rerotated copies, not cached).
         if self.policy.rope:
             hit_private = getattr(req, "pic_rope_hit_private_slots", None)
             if hit_private:
                 all_private = []
-                for (private_slots, _entry_slots) in hit_private.values():
+                for private_slots, _entry_slots in hit_private.values():
                     all_private.append(private_slots)
                 if all_private:
                     combined = torch.cat(all_private)
@@ -559,9 +590,8 @@ class PICache(BasePrefixCache):
         # HybridReqToTokenPool.alloc for the decode-time recurrent state.
         # release_kv_cache skips this branch for caches with
         # supports_mamba()=True (PIC), so we must free it ourselves.
-        if (
-            getattr(req, "mamba_pool_idx", None) is not None
-            and hasattr(self.req_to_token_pool, "free_mamba_cache")
+        if getattr(req, "mamba_pool_idx", None) is not None and hasattr(
+            self.req_to_token_pool, "free_mamba_cache"
         ):
             self.req_to_token_pool.free_mamba_cache(req)
 
@@ -577,14 +607,17 @@ class PICache(BasePrefixCache):
         candidates.sort(key=lambda e: self.eviction_strategy.get_priority(e))
         evicted_tokens = 0
         evicted_mamba = 0
+        evicted_entries = []
         for e in candidates:
             if evicted_tokens >= need_tokens and evicted_mamba >= need_mamba:
                 break
             self.token_to_kv_pool_allocator.free(e.full_kv_slots)
-            self.mamba_allocator.free(torch.tensor([e.mamba_state_slot], dtype=torch.int64,
-                                             device=e.full_kv_slots.device))
             evicted_tokens += int(e.full_kv_slots.numel())
             evicted_mamba += 1
+            evicted_entries.append(e)
+
+        self._free_mamba_slots([entry.mamba_state_slot for entry in evicted_entries])
+        for e in evicted_entries:
             del self._entries[e.seg_hash]
         self.update_eviction_metrics(evicted_tokens, start_time)
         return EvictResult(
